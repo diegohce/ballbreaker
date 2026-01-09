@@ -17,11 +17,15 @@ limitations under the License.
 package ballbreaker
 
 import (
+	"context"
 	"sync"
 	"time"
 )
 
 type CircuitStateType int
+
+// StateChangeHook is a callback function that is called when the circuit breaker changes state.
+type StateChangeHook func(from, to CircuitStateType)
 
 const (
 	StateClosed CircuitStateType = iota
@@ -40,22 +44,30 @@ type CircuitBreaker struct {
 	timeout        time.Duration
 	lastFailure    time.Time
 	openStateError error
+
+	// OnStateChange is called whenever the circuit breaker transitions between states.
+	OnStateChange StateChangeHook
 }
 
-// New creates a new circuit breaker.
-// maxFailures is the number of failures before opening the circuit.
-// maxSuccesses is the number of successes before closing the circuit.
-// timeout is the time to wait before trying to close the circuit.
-func New(maxFailures int, maxSuccesses int, timeout time.Duration) *CircuitBreaker {
-	return &CircuitBreaker{
+// New creates a new circuit breaker with functional options.
+// If no options are provided, it uses sensible defaults:
+// - MaxFailures: 5
+// - MaxSuccesses: 2
+// - Timeout: 5 seconds
+func New(opts ...Option) *CircuitBreaker {
+	cb := &CircuitBreaker{
 		state:        StateClosed,
-		maxFailures:  maxFailures,
-		failureCount: 0,
-		successCount: 0,
-		maxSuccesses: maxSuccesses,
-		timeout:      timeout,
+		maxFailures:  5,
+		maxSuccesses: 2,
+		timeout:      5 * time.Second,
 		lastFailure:  time.Now(),
 	}
+
+	for _, opt := range opts {
+		opt(cb)
+	}
+
+	return cb
 }
 
 // State returns the current state of the circuit breaker.
@@ -69,23 +81,40 @@ func (cb *CircuitBreaker) State() CircuitStateType {
 }
 
 // Do executes the given function and returns the result.
-// If the circuit breaker is open, it returns the last recorded error.
+// It is a shorthand for DoWithContext(context.Background(), fn).
 func (cb *CircuitBreaker) Do(fn func() error) error {
+	return cb.DoWithContext(context.Background(), fn)
+}
+
+// DoWithContext executes the given function and returns the result.
+// If the context is cancelled, it returns the context error.
+// If the circuit breaker is open, it returns the last recorded error.
+func (cb *CircuitBreaker) DoWithContext(ctx context.Context, fn func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	cb.Lock()
 
 	switch cb.state {
 	case StateClosed:
 		cb.Unlock()
 		err := fn()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		cb.Lock()
 		defer cb.Unlock()
 		return cb.handleClosedState(err)
 
 	case StateOpen:
 		if time.Since(cb.lastFailure) > cb.timeout {
-			cb.state = StateHalfOpen
+			cb.setState(StateHalfOpen)
 			cb.Unlock()
 			err := fn()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			cb.Lock()
 			defer cb.Unlock()
 			return cb.handleHalfOpenState(err)
@@ -96,6 +125,9 @@ func (cb *CircuitBreaker) Do(fn func() error) error {
 	case StateHalfOpen:
 		cb.Unlock()
 		err := fn()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		cb.Lock()
 		defer cb.Unlock()
 		return cb.handleHalfOpenState(err)
@@ -111,7 +143,7 @@ func (cb *CircuitBreaker) handleClosedState(err error) error {
 	if err != nil {
 		cb.failureCount++
 		if cb.failureCount >= cb.maxFailures {
-			cb.state = StateOpen
+			cb.setState(StateOpen)
 			cb.openStateError = err
 			cb.failureCount = 0
 			cb.lastFailure = time.Now()
@@ -126,7 +158,7 @@ func (cb *CircuitBreaker) handleClosedState(err error) error {
 // Must be called with lock held.
 func (cb *CircuitBreaker) handleHalfOpenState(err error) error {
 	if err != nil {
-		cb.state = StateOpen
+		cb.setState(StateOpen)
 		cb.openStateError = err
 		cb.failureCount = 0
 		cb.successCount = 0
@@ -136,10 +168,30 @@ func (cb *CircuitBreaker) handleHalfOpenState(err error) error {
 
 	cb.successCount++
 	if cb.successCount >= cb.maxSuccesses {
-		cb.state = StateClosed
+		cb.setState(StateClosed)
 		cb.successCount = 0
 		cb.failureCount = 0
 		cb.openStateError = nil
 	}
 	return nil
+}
+
+// setState changes the state of the circuit breaker and triggers the OnStateChange hook.
+// It assumes the lock is held but may temporarily release it to call the hook.
+func (cb *CircuitBreaker) setState(newState CircuitStateType) {
+	if cb.state == newState {
+		return
+	}
+
+	oldState := cb.state
+	cb.state = newState
+
+	if cb.OnStateChange != nil {
+		hook := cb.OnStateChange
+		// We call the hook while holding the lock to ensure state consistency,
+		// but we could also unlock/lock. However, in this library's simple usage,
+		// calling it inside is standard unless we expect heavy/complex hooks.
+		// For safety against deadlocks in user code, we recommend simple hooks.
+		hook(oldState, newState)
+	}
 }
