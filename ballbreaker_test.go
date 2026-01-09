@@ -17,6 +17,7 @@ limitations under the License.
 package ballbreaker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,7 +38,11 @@ func TestBreaker(t *testing.T) {
 	}))
 	defer remote.Close()
 
-	cb := New(2, 2, 1*time.Second)
+	cb := New(
+		WithMaxFailures(2),
+		WithMaxSuccesses(2),
+		WithTimeout(1*time.Second),
+	)
 
 	cases := []struct {
 		name          string
@@ -89,7 +94,11 @@ func TestBreakerConcurrency(t *testing.T) {
 	const workers = 20
 	const iterations = 100
 
-	cb := New(10, 10, 1*time.Second)
+	cb := New(
+		WithMaxFailures(10),
+		WithMaxSuccesses(10),
+		WithTimeout(1*time.Second),
+	)
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
@@ -105,4 +114,85 @@ func TestBreakerConcurrency(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func BenchmarkDoClosed(b *testing.B) {
+	cb := New(
+		WithMaxFailures(10),
+		WithMaxSuccesses(10),
+		WithTimeout(1*time.Second),
+	)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = cb.Do(func() error {
+			return nil
+		})
+	}
+}
+
+func BenchmarkDoParallel(b *testing.B) {
+	cb := New(
+		WithMaxFailures(100),
+		WithMaxSuccesses(100),
+		WithTimeout(1*time.Second),
+	)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = cb.Do(func() error {
+				return nil
+			})
+		}
+	})
+}
+
+func TestOnStateChangeHook(t *testing.T) {
+	cb := New(
+		WithMaxFailures(1),
+		WithMaxSuccesses(1),
+		WithTimeout(100*time.Millisecond),
+	)
+
+	var states []CircuitStateType
+	cb.OnStateChange = func(from, to CircuitStateType) {
+		states = append(states, to)
+	}
+
+	// 1. Trigger failure -> Open
+	_ = cb.Do(func() error { return errors.New("fail") })
+
+	// 2. Wait for timeout and trigger success -> Half-Open -> Closed
+	time.Sleep(150 * time.Millisecond)
+	_ = cb.Do(func() error { return nil })
+
+	expected := []CircuitStateType{StateOpen, StateHalfOpen, StateClosed}
+	if len(states) != len(expected) {
+		t.Fatalf("Expected %d state changes, got %d", len(expected), len(states))
+	}
+
+	for i, s := range states {
+		if s != expected[i] {
+			t.Errorf("At step %d, expected state %v, got %v", i, expected[i], s)
+		}
+	}
+}
+
+func TestDoWithContext(t *testing.T) {
+	cb := New(
+		WithMaxFailures(3),
+		WithMaxSuccesses(2),
+		WithTimeout(5*time.Second),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel context immediately
+	cancel()
+
+	err := cb.DoWithContext(ctx, func() error {
+		return nil
+	})
+
+	if err != context.Canceled {
+		t.Errorf("Expected context.Canceled error, got %v", err)
+	}
 }
