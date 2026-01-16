@@ -18,6 +18,8 @@ package ballbreaker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -32,6 +34,8 @@ const (
 	StateOpen
 	StateHalfOpen
 )
+
+var ErrCircuitBreakerOpen = errors.New("circuit breaker is open")
 
 type CircuitBreaker struct {
 	sync.Mutex
@@ -120,7 +124,8 @@ func (cb *CircuitBreaker) DoWithContext(ctx context.Context, fn func() error) er
 			return cb.handleHalfOpenState(err)
 		}
 		defer cb.Unlock()
-		return cb.openStateError
+		//return cb.openStateError
+		return fmt.Errorf("%w: %w", ErrCircuitBreakerOpen, cb.openStateError)
 
 	case StateHalfOpen:
 		cb.Unlock()

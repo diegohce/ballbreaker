@@ -54,7 +54,8 @@ func TestBreaker(t *testing.T) {
 		{"initial_success", http.StatusOK, nil, 0, StateClosed},
 		{"first_failure", http.StatusInternalServerError, ErrUnexpectedStatusCode, 0, StateClosed},
 		{"second_failure_opens", http.StatusInternalServerError, ErrUnexpectedStatusCode, 0, StateOpen},
-		{"fast_fail_while_open", http.StatusOK, ErrUnexpectedStatusCode, 0, StateOpen},
+		{"fast_fail_while_open(unexpected error)", http.StatusOK, ErrUnexpectedStatusCode, 0, StateOpen},
+		{"fast_fail_while_open(open circuit error)", http.StatusOK, ErrCircuitBreakerOpen, 0, StateOpen},
 		{"recover_to_half_open_then_fail", http.StatusInternalServerError, ErrUnexpectedStatusCode, 1100 * time.Millisecond, StateOpen},
 		{"still_open_after_half_open_failure", http.StatusOK, ErrUnexpectedStatusCode, 0, StateOpen},
 		{"recover_to_half_open_success_1", http.StatusOK, nil, 1100 * time.Millisecond, StateHalfOpen},
@@ -79,7 +80,8 @@ func TestBreaker(t *testing.T) {
 				return nil
 			})
 
-			if cbErr != c.expectedError {
+			//if cbErr != c.expectedError {
+			if !errors.Is(cbErr, c.expectedError) {
 				t.Errorf("Expected error %v, got %v", c.expectedError, cbErr)
 			}
 
